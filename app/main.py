@@ -9,6 +9,8 @@ from fastapi.responses import JSONResponse
 
 from .models import (
     ActionItem,
+    ApertureArc,
+    ApertureIntersection,
     AuditSafetyInterlockRequest,
     AuditSafetyInterlockResponse,
     CalibrateSyncRequest,
@@ -19,8 +21,15 @@ from .models import (
     InterlockRiskInterval,
     InterlockShutterSegment,
     InterlockStatusSegment,
+    ProjectDomeApertureRequest,
+    ProjectDomeApertureResponse,
+    SampleAperture,
     TrackRequest,
     TrackResponse,
+)
+from .planner.aperture import (
+    ApertureValidationError,
+    project_aperture,
 )
 from .planner.calibration import calibrate_sync, normalize_bias
 from .planner.interlock import Event, InterlockValidationError, audit_interlock
@@ -49,6 +58,21 @@ async def interlock_validation_error_handler(
     return JSONResponse(
         status_code=422,
         content={"detail": exc.message, "event_index": exc.event_index},
+    )
+
+
+@app.exception_handler(ApertureValidationError)
+async def aperture_validation_error_handler(
+    _request: Request, exc: ApertureValidationError
+) -> JSONResponse:
+    # 视轴投影语义非法（起点不在球内 / 误差越界 / 交点低于地平面等）→ HTTP 422
+    return JSONResponse(
+        status_code=422,
+        content={
+            "detail": exc.message,
+            "reason": exc.reason,
+            "sample_indices": exc.sample_indices,
+        },
     )
 
 
@@ -216,4 +240,62 @@ def audit_safety_interlock(
             for s in result.shutter_timeline
         ],
         horizon=round(result.horizon, 9),
+    )
+
+
+def _r9_clean(value: float) -> float:
+    """round 到 9 位并清除 -0.0。"""
+    r = round(value, 9)
+    return 0.0 if r == 0.0 else r
+
+
+@app.post(
+    "/api/v1/project-dome-aperture",
+    response_model=ProjectDomeApertureResponse,
+    tags=["dome-geometry"],
+)
+def project_dome_aperture_endpoint(
+    req: ProjectDomeApertureRequest,
+) -> ProjectDomeApertureResponse:
+    projections = project_aperture(
+        radius=req.dome_radius,
+        origin=(req.origin.east, req.origin.north, req.origin.up),
+        samples=[
+            (s.azimuth, s.altitude, s.azimuth_error, s.altitude_error)
+            for s in req.samples
+        ],
+    )
+
+    return ProjectDomeApertureResponse(
+        results=[
+            SampleAperture(
+                index=p.index,
+                nominal=ApertureIntersection(
+                    distance=_r9_clean(p.nominal.distance),
+                    east=_r9_clean(p.nominal.east),
+                    north=_r9_clean(p.nominal.north),
+                    up=_r9_clean(p.nominal.up),
+                    azimuth_deg=_r9_clean(p.nominal.azimuth_deg),
+                    altitude_deg=_r9_clean(p.nominal.altitude_deg),
+                ),
+                envelope=ApertureArc(
+                    crosses_zero=p.envelope_arc.crosses_zero,
+                    center_deg=_r9_clean(p.envelope_arc.center_deg),
+                    width_deg=_r9_clean(p.envelope_arc.width_deg),
+                    start_deg=(
+                        None
+                        if p.envelope_arc.start_deg is None
+                        else _r9_clean(p.envelope_arc.start_deg)
+                    ),
+                    end_deg=(
+                        None
+                        if p.envelope_arc.end_deg is None
+                        else _r9_clean(p.envelope_arc.end_deg)
+                    ),
+                ),
+                min_altitude_deg=_r9_clean(p.min_altitude_deg),
+                max_altitude_deg=_r9_clean(p.max_altitude_deg),
+            )
+            for p in projections
+        ]
     )

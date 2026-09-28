@@ -369,3 +369,96 @@ class AuditSafetyInterlockResponse(BaseModel):
     horizon: float = Field(
         ..., description="末个事件时刻：开口义务的超期量截算到此"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/project-dome-aperture
+# ---------------------------------------------------------------------------
+
+
+class ENUPoint(BaseModel):
+    east: float = Field(
+        ..., allow_inf_nan=False, description="视轴起点的东向坐标（长度单位，同穹顶半径）"
+    )
+    north: float = Field(
+        ..., allow_inf_nan=False, description="视轴起点的北向坐标（长度单位，同穹顶半径）"
+    )
+    up: float = Field(
+        ..., allow_inf_nan=False, description="视轴起点的天顶向坐标（长度单位，同穹顶半径）"
+    )
+
+
+class DomeApertureSample(BaseModel):
+    azimuth: float = Field(
+        ..., allow_inf_nan=False, description="标称视轴方位角（度，北为 0°、向东递增）"
+    )
+    altitude: float = Field(
+        ..., allow_inf_nan=False, description="标称视轴高度角（度，地平面为 0°）"
+    )
+    azimuth_error: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="方位角对称误差（度，>= 0；误差矩形半宽）",
+    )
+    altitude_error: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="高度角对称误差（度，>= 0；误差矩形半宽）",
+    )
+
+
+class ProjectDomeApertureRequest(BaseModel):
+    dome_radius: float = Field(
+        ..., gt=0, allow_inf_nan=False,
+        description="球形穹顶半径（长度单位，球心位于 ENU 原点）",
+    )
+    origin: ENUPoint = Field(..., description="视轴起点（望远镜转轴）的 ENU 坐标")
+    samples: list[DomeApertureSample] = Field(
+        ..., min_length=1, max_length=5000,
+        description="各样本的方位角、高度角及二者的对称误差",
+    )
+
+
+class ApertureArc(BaseModel):
+    crosses_zero: bool = Field(
+        ..., description="最短圆弧是否跨过 0°/360° 边界"
+    )
+    center_deg: float = Field(
+        ..., description="圆弧中心方位角（度，归一化到 [0, 360)）"
+    )
+    width_deg: float = Field(..., description="圆弧角宽（度，[0, 360)）")
+    start_deg: float | None = Field(
+        None, description="不跨 0° 时的起点方位角（度）；跨 0° 时为 null"
+    )
+    end_deg: float | None = Field(
+        None, description="不跨 0° 时的终点方位角（度）；跨 0° 时为 null"
+    )
+
+
+class ApertureIntersection(BaseModel):
+    distance: float = Field(..., description="自视轴起点到交点的前向距离（长度单位）")
+    east: float = Field(..., description="交点东向坐标（ENU，长度单位）")
+    north: float = Field(..., description="交点北向坐标（ENU，长度单位）")
+    up: float = Field(..., description="交点天顶向坐标（ENU，长度单位）")
+    azimuth_deg: float = Field(
+        ..., description="交点的球面方位角（度，自球心量取，北 0° 向东递增）"
+    )
+    altitude_deg: float = Field(
+        ..., description="交点的球面高度角（度，自球心量取）"
+    )
+
+
+class SampleAperture(BaseModel):
+    index: int = Field(..., description="样本在输入 samples 中的 0 基索引")
+    nominal: ApertureIntersection = Field(..., description="标称视轴与球面的交点")
+    envelope: ApertureArc = Field(..., description="五个交点方位的最短圆弧包络")
+    min_altitude_deg: float = Field(
+        ..., description="五个交点球面高度角的下界（度）"
+    )
+    max_altitude_deg: float = Field(
+        ..., description="五个交点球面高度角的上界（度）"
+    )
+
+
+class ProjectDomeApertureResponse(BaseModel):
+    results: list[SampleAperture] = Field(
+        ..., description="按输入顺序排列的各样本文本投影结果"
+    )

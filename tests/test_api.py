@@ -337,3 +337,205 @@ def test_calibrate_validation_min_inliers_positive():
     payload = _calibrate_payload(min_inliers=0)
     r = client.post("/api/v1/calibrate-sync", json=payload)
     assert r.status_code == 422
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/project-dome-aperture
+# ---------------------------------------------------------------------------
+
+
+def _aperture_payload(
+    radius=10.0,
+    origin=(0.0, 0.0, 0.0),
+    samples=((30.0, 20.0, 2.0, 1.0),),
+    **overrides,
+):
+    body = {
+        "dome_radius": radius,
+        "origin": {"east": origin[0], "north": origin[1], "up": origin[2]},
+        "samples": [
+            {
+                "azimuth": s[0],
+                "altitude": s[1],
+                "azimuth_error": s[2],
+                "altitude_error": s[3],
+            }
+            for s in samples
+        ],
+    }
+    body.update(overrides)
+    return body
+
+
+def test_project_aperture_centered():
+    r = client.post("/api/v1/project-dome-aperture", json=_aperture_payload())
+    assert r.status_code == 200, r.text
+    res = r.json()["results"][0]
+    assert res["index"] == 0
+    nominal = res["nominal"]
+    assert nominal["distance"] == pytest.approx(10.0, abs=1e-9)
+    assert nominal["east"] == pytest.approx(
+        10.0 * math.sin(math.radians(30.0)) * math.cos(math.radians(20.0)),
+        abs=1e-9,
+    )
+    assert nominal["azimuth_deg"] == pytest.approx(30.0, abs=1e-9)
+    assert nominal["altitude_deg"] == pytest.approx(20.0, abs=1e-9)
+    env = res["envelope"]
+    assert env["crosses_zero"] is False
+    assert (env["start_deg"], env["end_deg"]) == (28.0, 32.0)
+    assert env["center_deg"] == 30.0
+    assert env["width_deg"] == 4.0
+    assert (res["min_altitude_deg"], res["max_altitude_deg"]) == (19.0, 21.0)
+
+
+def test_project_aperture_eccentric_origin():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(origin=(1.5, -2.0, 0.5), samples=((90.0, 0.0, 1.0, 1.0),)),
+    )
+    assert r.status_code == 200, r.text
+    nominal = r.json()["results"][0]["nominal"]
+    t = -1.5 + math.sqrt(100.0 - 4.0 - 0.25)
+    assert nominal["distance"] == pytest.approx(t, abs=1e-9)
+    assert nominal["east"] == pytest.approx(1.5 + t, abs=1e-9)
+    assert nominal["north"] == pytest.approx(-2.0, abs=1e-9)
+    assert nominal["up"] == pytest.approx(0.5, abs=1e-9)
+    # 交点在球面上
+    radius2 = nominal["east"] ** 2 + nominal["north"] ** 2 + nominal["up"] ** 2
+    assert radius2 == pytest.approx(100.0, abs=1e-7)
+    # 偏心：交点方位偏离 90°（北向分量为负）
+    assert nominal["azimuth_deg"] > 90.0
+
+
+def test_project_aperture_crosses_zero_center_width():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(samples=((0.0, 30.0, 2.0, 1.0),)),
+    )
+    assert r.status_code == 200, r.text
+    env = r.json()["results"][0]["envelope"]
+    assert env["crosses_zero"] is True
+    assert env["start_deg"] is None and env["end_deg"] is None
+    assert env["width_deg"] == pytest.approx(4.0)
+    assert env["center_deg"] == pytest.approx(0.0, abs=1e-9)
+
+
+def test_project_aperture_tie_arc_regression():
+    # 并列回归：方位点 {0, 120, 120, 240, 240}（标称 0°、方位误差 120°），
+    # 三个非零间隙均为 120°，并列取间隙中心较小者（60°：0→120° 间隙），
+    # 故包络自 120° 沿增向经 0° 闭合，宽 240°、中心 240°
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(samples=((0.0, 45.0, 120.0, 5.0),)),
+    )
+    assert r.status_code == 200, r.text
+    env = r.json()["results"][0]["envelope"]
+    assert env["crosses_zero"] is True
+    assert env["start_deg"] is None and env["end_deg"] is None
+    assert env["width_deg"] == pytest.approx(240.0, abs=1e-7)
+    assert env["center_deg"] == pytest.approx(240.0, abs=1e-7)
+
+
+def test_project_aperture_near_tangent_horizon_accepted():
+    # 起点贴近球壁、射线擦地平：交点 z 恰为 0，允许通过
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(
+            origin=(0.0, 9.9, 0.0), samples=((180.0, 0.0, 0.0, 0.0),)
+        ),
+    )
+    assert r.status_code == 200, r.text
+    nominal = r.json()["results"][0]["nominal"]
+    assert nominal["north"] == pytest.approx(-10.0, abs=1e-9)
+    assert nominal["up"] == pytest.approx(0.0, abs=1e-9)
+    assert nominal["distance"] == pytest.approx(19.9, abs=1e-9)
+
+
+def test_project_aperture_origin_outside_returns_422():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(origin=(0.0, 0.0, 10.0), samples=((0.0, 10.0, 0.0, 0.0),)),
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["reason"] == "origin_outside_sphere"
+    assert body["sample_indices"] == []
+
+
+def test_project_aperture_altitude_range_returns_422_with_indices():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(
+            samples=((0.0, 45.0, 0.5, 0.5), (0.0, 89.0, 0.0, 2.0))
+        ),
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["reason"] == "altitude_error_out_of_range"
+    assert body["sample_indices"] == [1]
+
+
+def test_project_aperture_below_ground_returns_422_with_indices():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(
+            samples=((0.0, 45.0, 0.5, 0.5), (180.0, 0.0, 0.0, 0.5))
+        ),
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["reason"] == "intersection_below_ground"
+    assert body["sample_indices"] == [1]
+
+
+def test_project_aperture_multiple_bad_indices():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(
+            samples=(
+                (180.0, -2.0, 0.0, 0.0),
+                (0.0, 45.0, 0.1, 0.1),
+                (90.0, -1.0, 0.0, 0.0),
+            )
+        ),
+    )
+    assert r.status_code == 422
+    assert r.json()["sample_indices"] == [0, 2]
+
+
+def test_project_aperture_origin_outside_takes_precedence():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(
+            origin=(0.0, 0.0, 11.0),
+            samples=((0.0, 89.0, 0.0, 2.0), (180.0, -5.0, 0.0, 0.0)),
+        ),
+    )
+    assert r.status_code == 422
+    body = r.json()
+    assert body["reason"] == "origin_outside_sphere"
+    assert body["sample_indices"] == []
+
+
+def test_project_aperture_validation_empty_samples():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(samples=()),
+    )
+    assert r.status_code == 422
+
+
+def test_project_aperture_validation_negative_radius():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(radius=-1.0),
+    )
+    assert r.status_code == 422
+
+
+def test_project_aperture_validation_negative_error():
+    r = client.post(
+        "/api/v1/project-dome-aperture",
+        json=_aperture_payload(samples=((30.0, 20.0, -0.1, 1.0),)),
+    )
+    assert r.status_code == 422
