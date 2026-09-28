@@ -365,6 +365,108 @@ curl -X POST http://localhost:8000/api/v1/audit-safety-interlock \
 阈值、`stale_after <= 0`）、未知事件类型、快门缺初值（全程无 `shutter`
 事件）或跳态（未沿 `open → closing → closed → opening` 循环逐步转换）。
 
+### POST `/api/v1/project-dome-aperture`
+
+把望远镜**视轴前向射线**投影到**偏心球形穹顶**的内表面：给定穹顶半径、
+视轴起点的 ENU 坐标与若干样本（标称方位角、高度角及二者的**对称误差**），
+对每个样本的**标称视轴**与**误差矩形四角**
+`(az ± δaz, el ± δel)` 共 5 条射线，分别求其与球面的**最近正根**，并汇总
+五个交点的**开口包络**（最短覆盖圆弧 + 高度上下界）。
+
+坐标系与约定：
+
+- ENU 局部直角坐标：`east` 向东、`north` 向北、`up` 指向天顶，单位与
+  `dome_radius` 相同；球心固定在穹顶地平面原点 `(0, 0, 0)`；
+- 方位角**北为 0°、向东递增**（东 90°、南 180°、西 270°），可取任意实数；
+  高度角自地平面起算，标称及四角高度都必须在 `[-90°, 90°]`；
+- 视轴起点必须**严格位于球内**（`|origin| < dome_radius`，球面上也拒绝）；
+- 穹顶地平面为 `up = 0`；五个交点中任一 `up < 0`（低于地平面）该样本非法。
+
+**请求字段**（角度单位：度）：
+
+| 字段 | 类型 | 说明 |
+| --- | --- | --- |
+| `dome_radius` | number | 球形穹顶半径（> 0） |
+| `origin` | object | 视轴起点 ENU 坐标 `{east, north, up}`，须严格位于球内 |
+| `samples` | object[] | 样本（长度 1..5000） |
+| `samples[].index` | integer | 样本在数组中的 **0 基**下标（必须与位置一致） |
+| `samples[].azimuth` | number | 标称视轴方位角（度，北 0° 向东递增） |
+| `samples[].elevation` | number | 标称视轴高度角（度，`[-90, 90]`） |
+| `samples[].azimuth_error` | number | 方位角对称误差半宽 `δaz`（度，≥ 0） |
+| `samples[].elevation_error` | number | 高度角对称误差半宽 `δel`（度，≥ 0） |
+
+**示例请求**：
+
+```bash
+curl -X POST http://localhost:8000/api/v1/project-dome-aperture \
+  -H 'Content-Type: application/json' \
+  -d @examples/project_dome_aperture_request.json
+```
+
+每个样本返回：
+
+- `nominal`：标称视轴的前向球面交点，含
+  - `distance`：自起点沿前向射线到交点的距离（二次方程的最近正根）；
+  - `point`：交点 ENU 坐标；
+  - `azimuth` / `elevation`：交点相对**球心**的球面方位角（`[0, 360)`）
+    与高度角（`[-90, 90]`）——偏心时与视线指向角并不相同；
+- `corners`：误差矩形四角交点，固定顺序
+  `(-δaz,-δel)`、`(+δaz,-δel)`、`(-δaz,+δel)`、`(+δaz,+δel)`，
+  每项回显 `daz` / `dele` 并给出与 `nominal` 同构的交点；
+- `envelope`：标称 + 四角共五个交点的开口包络：
+  - `azimuth_center` / `azimuth_width`：**最短覆盖圆弧**的中心（归一化到
+    `[0, 360)`）与角宽；圆弧由最大间隙法（圆周去掉最大的点间间隙）得到，
+    最大间隙**并列时取 center 较小者**；
+  - `azimuth_crosses_zero`：覆盖圆弧是否跨越 0°/360° 边界——跨 0° 时
+    一律以 `center/width` 表示（例如点集在 350°..10° 时为
+    `center=0, width=20, azimuth_crosses_zero=true`）；
+  - `elevation_low` / `elevation_high`：五个交点球面高度的下/上界。
+
+响应片段（偏心起点 `(1.5, -0.8, 2)`、R=10；有删减）：
+
+```json
+{
+  "dome_radius": 10.0,
+  "origin": {"east": 1.5, "north": -0.8, "up": 2.0},
+  "results": [
+    {
+      "index": 0,
+      "nominal": {
+        "distance": 9.17889224,
+        "point": {"east": 0.279003363, "north": 6.12461603, "up": 7.900078202},
+        "azimuth": 2.608273065,
+        "elevation": 52.186242314
+      },
+      "corners": [
+        { "daz": -2.0, "dele": -1.0, "intersection": { "distance": 9.249836755, "...": "..." } }
+      ],
+      "envelope": {
+        "azimuth_center": 2.608580923,
+        "azimuth_width": 5.117263848,
+        "azimuth_crosses_zero": false,
+        "elevation_low": 51.055279465,
+        "elevation_high": 53.317827278
+      }
+    }
+  ]
+}
+```
+
+**HTTP 422**（以下情况不产生 `results`，响应体指明原因）：
+
+- 视轴起点不在球内（含恰在球面）：`reason = "origin_outside_sphere"`，
+  并回显 `origin`、`origin_radius`、`dome_radius`；
+- 标称或四角高度角越出 `[-90°, 90°]`：
+  `elevation_out_of_range_indices` 给出全部相关样本的 **0 基索引**；
+- 五个交点中任一低于穹顶地平面（`up < 0`）：
+  `below_ground_indices` 给出全部相关样本的 **0 基索引**；
+- 结构/参数非法（`dome_radius <= 0`、`samples` 为空或超长、误差为负、
+  `index` 与数组下标不一致、NaN/无穷大等）同样返回 422。
+
+数值说明：射线-球面求根采用稳定形式（`c = (|o|−R)(|o|+R)` 因式计算，
+`B = o·d ≥ 0` 时正根取 `-c/(B+√(B²−c))`），在起点贴近球面的**近切线**
+情形下避免相消误差。
+
 ## 算法说明
 
 角度使用**未展开（unwrapped）**表示，因此跨 0°/360° 的跟踪不需要特判：每个
@@ -407,7 +509,7 @@ python3 scripts/fuzz_check.py
 
 ```
 app/
-  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock
+  main.py              # FastAPI 入口：/health、/api/v1/track、/api/v1/calibrate-sync、/api/v1/audit-safety-interlock、/api/v1/project-dome-aperture
   models.py            # Pydantic 请求/响应模型与参数校验
   planner/
     geometry.py        # 方位归一化、狭缝窗口（lift）、线缆裁剪、区间合并
@@ -415,9 +517,10 @@ app/
     solver.py          # 前向诊断 + 反向值函数 DP + 字典序路径重建
     calibration.py     # 最短弧展开 + 时延枚举/离群剔除/RMSE 同步标定
     interlock.py       # 安全联锁审计：分段常值重放、天气状态机、关闭义务
-examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计）
+    aperture.py        # 视轴射线-偏心球面稳定求交、球面方位/高度、最短覆盖圆弧开口包络
+examples/              # 示例请求（跟踪有解 / 无解、同步标定、联锁审计、穹顶投影）
 scripts/fuzz_check.py  # 与网格暴力 DP 的随机对拍
-tests/                 # 几何、求解器、标定算法、联锁审计、HTTP API 测试
+tests/                 # 几何、求解器、标定算法、联锁审计、穹顶投影、HTTP API 测试
 Dockerfile
 docker-compose.yml
 ```

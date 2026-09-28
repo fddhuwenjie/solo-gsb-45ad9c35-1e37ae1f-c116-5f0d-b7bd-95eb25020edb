@@ -369,3 +369,112 @@ class AuditSafetyInterlockResponse(BaseModel):
     horizon: float = Field(
         ..., description="末个事件时刻：开口义务的超期量截算到此"
     )
+
+
+# ---------------------------------------------------------------------------
+# POST /api/v1/project-dome-aperture
+# ---------------------------------------------------------------------------
+
+
+class EnuPoint(BaseModel):
+    east: float = Field(..., allow_inf_nan=False, description="东向坐标 E")
+    north: float = Field(..., allow_inf_nan=False, description="北向坐标 N")
+    up: float = Field(..., allow_inf_nan=False, description="天顶向坐标 U")
+
+
+class ApertureSample(BaseModel):
+    index: int = Field(
+        ..., ge=0, description="样本在 samples 数组中的 0 基下标（须与位置一致）"
+    )
+    azimuth: float = Field(
+        ..., allow_inf_nan=False,
+        description="标称视轴方位角（度，北为 0°、向东递增，可取任意实数）",
+    )
+    elevation: float = Field(
+        ..., allow_inf_nan=False,
+        description="标称视轴高度角（度，自地平面起算，须在 [-90, 90]）",
+    )
+    azimuth_error: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="方位角对称误差半宽（度，>= 0），误差矩形四角为 az ± 该值",
+    )
+    elevation_error: float = Field(
+        ..., ge=0, allow_inf_nan=False,
+        description="高度角对称误差半宽（度，>= 0），误差矩形四角为 el ± 该值",
+    )
+
+
+class ProjectDomeApertureRequest(BaseModel):
+    dome_radius: float = Field(
+        ..., gt=0, allow_inf_nan=False, description="球形穹顶半径（> 0，长度单位）"
+    )
+    origin: EnuPoint = Field(
+        ..., description="视轴起点（望远镜转轴）的 ENU 坐标；必须严格位于球内"
+    )
+    samples: list[ApertureSample] = Field(
+        ..., min_length=1, max_length=5000,
+        description="待投影样本（长度 1..5000）；index 须为其 0 基数组下标",
+    )
+
+    @model_validator(mode="after")
+    def _validate(self) -> "ProjectDomeApertureRequest":
+        for i, s in enumerate(self.samples):
+            if s.index != i:
+                raise ValueError(
+                    f"samples[{i}].index 必须等于其数组下标 {i}，实际为 {s.index}"
+                )
+        return self
+
+
+class ApertureIntersection(BaseModel):
+    distance: float = Field(
+        ..., description="自视轴起点沿前向射线到球面交点的距离（长度单位）"
+    )
+    point: EnuPoint = Field(..., description="交点 ENU 坐标")
+    azimuth: float = Field(
+        ..., description="交点相对球心的球面方位角（度，[0, 360)，北为 0°）"
+    )
+    elevation: float = Field(
+        ..., description="交点相对球心的球面高度角（度，[-90, 90]）"
+    )
+
+
+class ApertureCorner(BaseModel):
+    daz: float = Field(..., description="四角方位角取值 az + daz（度）")
+    dele: float = Field(..., description="四角高度角取值 el + dele（度）")
+    intersection: ApertureIntersection
+
+
+class ApertureEnvelope(BaseModel):
+    azimuth_center: float = Field(
+        ..., description="最短覆盖圆弧中心方位角（度，归一化到 [0, 360)）"
+    )
+    azimuth_width: float = Field(
+        ..., description="最短覆盖圆弧角宽（度，[0, 360]）"
+    )
+    azimuth_crosses_zero: bool = Field(
+        ..., description="覆盖圆弧是否跨越 0°/360° 边界"
+    )
+    elevation_low: float = Field(..., description="五个交点球面高度下界（度）")
+    elevation_high: float = Field(..., description="五个交点球面高度上界（度）")
+
+
+class ApertureSampleResult(BaseModel):
+    index: int = Field(..., description="样本 0 基下标（回显）")
+    nominal: ApertureIntersection = Field(
+        ..., description="标称视轴前向射线与球面的最近正根交点"
+    )
+    corners: list[ApertureCorner] = Field(
+        ...,
+        description="误差矩形四角交点，固定顺序："
+        "(-daz,-dele)、(+daz,-dele)、(-daz,+dele)、(+daz,+dele)",
+    )
+    envelope: ApertureEnvelope = Field(
+        ..., description="标称 + 四角共五个交点的开口包络"
+    )
+
+
+class ProjectDomeApertureResponse(BaseModel):
+    dome_radius: float
+    origin: EnuPoint
+    results: list[ApertureSampleResult]

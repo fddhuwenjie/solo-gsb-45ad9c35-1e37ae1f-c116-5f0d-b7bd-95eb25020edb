@@ -9,18 +9,33 @@ from fastapi.responses import JSONResponse
 
 from .models import (
     ActionItem,
+    ApertureCorner,
+    ApertureEnvelope,
+    ApertureIntersection,
+    ApertureSampleResult,
     AuditSafetyInterlockRequest,
     AuditSafetyInterlockResponse,
     CalibrateSyncRequest,
     CalibrateSyncResponse,
+    EnuPoint,
     FailureDetail,
     HealthResponse,
     InterlockCommandRecord,
     InterlockRiskInterval,
     InterlockShutterSegment,
     InterlockStatusSegment,
+    ProjectDomeApertureRequest,
+    ProjectDomeApertureResponse,
     TrackRequest,
     TrackResponse,
+)
+from .planner.aperture import (
+    ANGLE_EPS,
+    ApertureValidationError,
+    Vec3,
+    aperture_envelope,
+    ensure_origin_inside,
+    project_ray,
 )
 from .planner.calibration import calibrate_sync, normalize_bias
 from .planner.interlock import Event, InterlockValidationError, audit_interlock
@@ -50,6 +65,14 @@ async def interlock_validation_error_handler(
         status_code=422,
         content={"detail": exc.message, "event_index": exc.event_index},
     )
+
+
+@app.exception_handler(ApertureValidationError)
+async def aperture_validation_error_handler(
+    _request: Request, exc: ApertureValidationError
+) -> JSONResponse:
+    # 视轴起点不在球内 / 误差越出高度角范围 / 交点低于地平面 → HTTP 422
+    return JSONResponse(status_code=422, content=exc.payload)
 
 
 @app.post("/api/v1/track", response_model=TrackResponse, tags=["tracking"])
@@ -216,4 +239,110 @@ def audit_safety_interlock(
             for s in result.shutter_timeline
         ],
         horizon=round(result.horizon, 9),
+    )
+
+
+# 误差矩形四角的 (方位偏移, 高度偏移) 固定顺序
+_APERTURE_CORNER_SIGNS = (
+    (-1.0, -1.0),
+    (1.0, -1.0),
+    (-1.0, 1.0),
+    (1.0, 1.0),
+)
+
+
+def _aperture_intersection_model(hit) -> ApertureIntersection:
+    return ApertureIntersection(
+        distance=round(hit.distance, 9),
+        point=EnuPoint(
+            east=round(hit.point.e, 9),
+            north=round(hit.point.n, 9),
+            up=round(hit.point.u, 9),
+        ),
+        azimuth=round(hit.azimuth, 9),
+        elevation=round(hit.elevation, 9),
+    )
+
+
+@app.post(
+    "/api/v1/project-dome-aperture",
+    response_model=ProjectDomeApertureResponse,
+    tags=["aperture"],
+)
+def project_dome_aperture(
+    req: ProjectDomeApertureRequest,
+) -> ProjectDomeApertureResponse:
+    radius = req.dome_radius
+    origin = Vec3(req.origin.east, req.origin.north, req.origin.up)
+
+    # 视轴起点必须严格位于球内（含球面上也拒绝）
+    ensure_origin_inside(origin, radius)
+
+    out_of_range_indices: list[int] = []
+    below_ground_indices: list[int] = []
+    sample_results: list[ApertureSampleResult] = []
+
+    ground_tol = 1e-9 * radius
+
+    for s in req.samples:
+        corner_angles = [
+            (s.azimuth + sa * s.azimuth_error,
+             s.elevation + se * s.elevation_error)
+            for sa, se in _APERTURE_CORNER_SIGNS
+        ]
+
+        # 标称及四角高度角都必须落在 [-90, 90]
+        el_values = [s.elevation] + [el for _az, el in corner_angles]
+        if not all(-90.0 - ANGLE_EPS <= el <= 90.0 + ANGLE_EPS
+                   for el in el_values):
+            out_of_range_indices.append(s.index)
+            continue
+
+        hits = [project_ray(origin, s.azimuth, s.elevation, radius)]
+        hits.extend(
+            project_ray(origin, az, el, radius) for az, el in corner_angles
+        )
+
+        # 任一交点低于穹顶地平面（U < 0）即非法
+        if any(h.point.u < -ground_tol for h in hits):
+            below_ground_indices.append(s.index)
+            continue
+
+        env = aperture_envelope(hits)
+        sample_results.append(
+            ApertureSampleResult(
+                index=s.index,
+                nominal=_aperture_intersection_model(hits[0]),
+                corners=[
+                    ApertureCorner(
+                        daz=round(sa * s.azimuth_error, 9),
+                        dele=round(se * s.elevation_error, 9),
+                        intersection=_aperture_intersection_model(hits[k + 1]),
+                    )
+                    for k, (sa, se) in enumerate(_APERTURE_CORNER_SIGNS)
+                ],
+                envelope=ApertureEnvelope(
+                    azimuth_center=round(env.azimuth_center, 9),
+                    azimuth_width=round(env.azimuth_width, 9),
+                    azimuth_crosses_zero=env.azimuth_crosses_zero,
+                    elevation_low=round(env.elevation_low, 9),
+                    elevation_high=round(env.elevation_high, 9),
+                ),
+            )
+        )
+
+    if out_of_range_indices or below_ground_indices:
+        raise ApertureValidationError({
+            "detail": (
+                "存在非法样本：误差角越出高度角范围 [-90, 90]，"
+                "或交点低于穹顶地平面（详见样本索引列表）"
+            ),
+            "elevation_out_of_range_indices": out_of_range_indices,
+            "below_ground_indices": below_ground_indices,
+        })
+
+    return ProjectDomeApertureResponse(
+        dome_radius=radius,
+        origin=EnuPoint(east=origin.e, north=origin.n, up=origin.u),
+        results=sample_results,
     )
